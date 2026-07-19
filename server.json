@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.selflabbs/economy-intel-mcp",
+  "title": "Economy Intel MCP",
+  "description": "Macro data for AI agents: GDP, inflation, unemployment and more (World Bank, US BLS). No keys.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/selflabbs/economy-intel-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://economy.selflabbs.com/mcp"
+    }
+  ]
+}
