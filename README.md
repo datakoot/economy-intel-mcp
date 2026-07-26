@@ -1,4 +1,4 @@
-# Economy Intel MCP — by SelfLabbs
+# Economy Intel MCP — by Datakoot
 
 Macroeconomic data for AI agents — as MCP tools your agent can call mid-task to ground answers in real GDP, inflation, unemployment and trade figures for any country. No API keys.
 
@@ -17,13 +17,13 @@ No API keys required.
 ## Quick start
 
 ```
-claude mcp add --transport http economy-intel https://economy.selflabbs.com/mcp
+claude mcp add --transport http economy-intel https://economy.datakoot.com/mcp
 ```
 
-Or point any MCP client at `https://economy.selflabbs.com/mcp`.
+Or point any MCP client at `https://economy.datakoot.com/mcp`.
 
 ## Data & attribution
 
 Country data comes from the [World Bank Open Data](https://data.worldbank.org) API (CC-BY 4.0); US series come from the [US Bureau of Labor Statistics](https://www.bls.gov) public data API (US public domain). Informational only.
 
-Part of [SelfLabbs](https://selflabbs.com) — keyless intelligence APIs for AI agents.
+Part of [Datakoot](https://datakoot.com) — keyless intelligence APIs for AI agents.
