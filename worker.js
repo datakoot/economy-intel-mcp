@@ -1,0 +1,451 @@
+/**
+ * Economy Intel MCP — Datakoot
+ * Keyless Model Context Protocol server giving AI agents live macroeconomic data:
+ * GDP, inflation, unemployment, population, trade, debt and more for every country,
+ * plus key US labor & price series.
+ *
+ * Data sources (all public, keyless, commercial-reuse OK with attribution):
+ *   - World Bank Open Data  https://api.worldbank.org/v2   (CC-BY 4.0)
+ *   - US BLS Public Data     https://api.bls.gov/publicAPI/v1 (US public domain)
+ * (FRED is deliberately NOT used — it passes through third-party copyrighted series.)
+ *
+ * Cloudflare Worker (module). Bindings: KV namespace "RL" (rate-limit day counter).
+ */
+
+const POLAR_ORG = "7f455043-0b15-4a1c-b7a0-9c06c9f3b95e";
+const CHECKOUT = "https://buy.polar.sh/polar_cl_Q9y3qLrNbtsssN3w5m8SK56oNcruwrmxLEPnd34oAZf";
+const FREE_LIMIT = 100;
+const UA = "Datakoot-Economy-Intel/1.0 (+https://datakoot.com; contact@datakoot.com)";
+const SERVER = { name: "economy-intel", version: "1.0.0" };
+
+const WB = {
+  gdp: ["NY.GDP.MKTP.CD", "GDP (current US$)"],
+  gdp_per_capita: ["NY.GDP.PCAP.CD", "GDP per capita (current US$)"],
+  gdp_growth: ["NY.GDP.MKTP.KD.ZG", "GDP growth (annual %)"],
+  inflation: ["FP.CPI.TOTL.ZG", "Inflation, consumer prices (annual %)"],
+  population: ["SP.POP.TOTL", "Population, total"],
+  unemployment: ["SL.UEM.TOTL.ZS", "Unemployment (% of labor force)"],
+  life_expectancy: ["SP.DYN.LE00.IN", "Life expectancy at birth (years)"],
+  exports: ["NE.EXP.GNFS.CD", "Exports of goods & services (current US$)"],
+  imports: ["NE.IMP.GNFS.CD", "Imports of goods & services (current US$)"],
+  govt_debt_pct_gdp: ["GC.DOD.TOTL.GD.ZS", "Central govt debt (% of GDP)"],
+  real_interest_rate: ["FR.INR.RINR", "Real interest rate (%)"],
+  fdi: ["BX.KLT.DINV.CD.WD", "Foreign direct investment, net inflows (US$)"],
+  co2_per_capita: ["EN.GHG.CO2.PC.CE.AR5", "CO2 emissions per capita (t)"],
+  internet_users: ["IT.NET.USER.ZS", "Individuals using the Internet (% pop)"],
+};
+const PROFILE = ["gdp", "gdp_per_capita", "gdp_growth", "inflation", "unemployment", "population"]; const DK_BLS_FRESH = 21600, DK_BLS_KEEP = 3888000; async function dkBls(seriesId, env) { const ck = "bls:" + seriesId; let c = null; if (env && env.RL) { try { c = JSON.parse((await env.RL.get(ck)) || "null"); } catch (e) {} } if (c && c.data && (Date.now() - c.t) < DK_BLS_FRESH * 1000) return { seriesID: c.id, data: c.data, as_of: c.as_of, stale: false }; let up = "unavailable"; try { const bk = (env && env.BLS_KEY) || ""; const r = bk ? await fetch("https://api.bls.gov/publicAPI/v2/timeseries/data/", { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": UA }, body: JSON.stringify({ seriesid: [seriesId], registrationkey: bk }) }) : await fetch("https://api.bls.gov/publicAPI/v1/timeseries/data/" + encodeURIComponent(seriesId), { headers: { "User-Agent": UA, Accept: "application/json" } }); if (!r.ok) { up = "upstream " + r.status; } else { const d = await r.json().catch(function () { return null; }); if (!d) { up = "bad json from upstream"; } else if (d.status !== "REQUEST_SUCCEEDED") { const m = String((d.message && d.message[0]) || d.status || "unknown"); up = /threshold/i.test(m) ? "BLS daily request quota exhausted for this IP" : m.slice(0, 180); } else { const s = (d.Results && d.Results.series && d.Results.series[0]) || null; const data = s ? (s.data || []).map(function (x) { return { year: x.year, period: x.periodName, value: x.value }; }).slice(0, 24) : []; if (!data.length) return { _empty: true }; const rec = { id: s.seriesID, data: data, as_of: new Date().toISOString().slice(0, 10), t: Date.now() }; if (env && env.RL) { try { await env.RL.put(ck, JSON.stringify(rec), { expirationTtl: DK_BLS_KEEP }); } catch (e) {} } return { seriesID: rec.id, data: data, as_of: rec.as_of, stale: false }; } } } catch (e) { up = (e && e.message) || "network error"; } if (c && c.data) return { seriesID: c.id, data: c.data, as_of: c.as_of, stale: true, upstream: up }; return { _error: up }; }
+const BLS = {
+  us_unemployment_rate: ["LNS14000000", "US unemployment rate (%)"],
+  us_cpi: ["CUUR0000SA0", "US CPI-U, all items (index)"],
+  us_nonfarm_payrolls: ["CES0000000001", "US total nonfarm payrolls (thousands)"],
+  us_labor_participation: ["LNS11300000", "US labor force participation rate (%)"],
+  us_avg_hourly_earnings: ["CES0500000003", "US avg hourly earnings, private (US$)"],
+};
+
+/* ------------------------------------------------------------------ helpers */
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, mcp-protocol-version",
+};
+const json = (obj, status = 200, extra = {}) =>
+  new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", ...CORS, ...extra } });
+
+async function getJSON(url, { ttl = 21600 } = {}) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" }, cf: { cacheTtl: ttl, cacheEverything: true } });
+  if (r.status === 404) return { _notfound: true };
+  if (!r.ok) return { _error: `upstream ${r.status}` };
+  try { return await r.json(); } catch { return { _error: "bad json from upstream" }; }
+}
+
+/* checkAccess() was removed on 2026-09-02. It was defined but never called —
+ * dkGate() is the live paywall — and it still held the old licence test
+ * `d.status === "granted" || d.valid || d.id`, whose `|| d.id` clause accepts a
+ * REVOKED key, because Polar returns the key object for revoked keys too.
+ * Dead code that would silently reinstate a fixed billing hole if anyone ever
+ * re-pointed a call site at it. */
+/* ------------------------------------------------------------- data layer */
+async function wbSeries(country, indicatorCode, mrv = 12) {
+  const c = encodeURIComponent(String(country).trim());
+  const url = `https://api.worldbank.org/v2/country/${c}/indicator/${indicatorCode}?format=json&per_page=${mrv}&mrv=${mrv}`;
+  const d = await getJSON(url);
+  if (!Array.isArray(d) || d.length < 2 || !Array.isArray(d[1])) return null;
+  const meta = d[0] || {};
+  const points = d[1].filter((p) => p.value != null).map((p) => ({ year: p.date, value: p.value }));
+  const countryName = d[1][0] ? d[1][0].country.value : country;
+  return { country: countryName, series: points, total_available: meta.total };
+}
+async function blsSeries(seriesId) {
+  const d = await getJSON(`https://api.bls.gov/publicAPI/v1/timeseries/data/${encodeURIComponent(seriesId)}`, { ttl: 21600 });
+  if (!d || d.status !== "REQUEST_SUCCEEDED" || !d.Results || !d.Results.series) return null;
+  const s = d.Results.series[0] || {};
+  const data = (s.data || []).map((r) => ({ year: r.year, period: r.periodName, value: r.value })).slice(0, 24);
+  return { seriesID: s.seriesID, data };
+}
+
+/* ------------------------------------------------------------------- tools */
+const DK_AD = {"*.country":"Country as an ISO code or name, e.g. US, USA, or United States.","*.indicator":"World Bank indicator key: gdp, gdp_per_capita, gdp_growth, inflation, population, unemployment, life_expectancy, exports, imports, govt_debt_pct_gdp, real_interest_rate, fdi, co2_per_capita, internet_users. Call list_indicators for the full set. Raw World Bank codes are also accepted.","country_indicator.years":"How many of the most recent years to return.","compare_countries.countries":"Array of country codes or names to compare, e.g. [\"US\", \"DE\", \"JP\"].","us_series.series":"One of the five warm BLS series: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings. Those five are cached by Datakoot and always available. A raw BLS series ID is also accepted, but uncached series often hit BLS rate limits."};
+function dkDescribe(ts) { try { for (const t of ts) { const p = ((t.inputSchema || {}).properties) || {}; for (const k of Object.keys(p)) { const d = DK_AD[t.name + "." + k] || DK_AD["*." + k]; if (d && p[k] && !p[k].description) p[k].description = d; } } } catch (e) {} return ts; }
+const TOOLS = [
+  {
+    name: "country_indicator",
+    description: "Get a macroeconomic indicator for a country over recent years (World Bank). Indicators: gdp, gdp_per_capita, gdp_growth, inflation, unemployment, population, life_expectancy, exports, imports, govt_debt_pct_gdp, real_interest_rate, fdi, co2_per_capita, internet_users. Country accepts an ISO code (US, DE, JP) or a World Bank country code. You may also pass a raw World Bank indicator code.",
+    inputSchema: { type: "object", properties: { country: { type: "string" }, indicator: { type: "string" }, years: { type: "integer", default: 12 } }, required: ["country", "indicator"] },
+  },
+  {
+    name: "country_profile",
+    description: "Get a snapshot of a country's key macro indicators (latest available values): GDP, GDP per capita, GDP growth, inflation, unemployment, and population. Country accepts an ISO code.",
+    inputSchema: { type: "object", properties: { country: { type: "string" } }, required: ["country"] },
+  },
+  {
+    name: "compare_countries",
+    description: "Compare one indicator across several countries (latest available value each). Good for ranking or benchmarking economies.",
+    inputSchema: { type: "object", properties: { countries: { type: "array", items: { type: "string" } }, indicator: { type: "string" } }, required: ["countries", "indicator"] },
+  },
+  {
+    name: "us_series",
+    description: "Get a key US economic time series from the Bureau of Labor Statistics: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings. These five are kept warm by Datakoot and are always available. A raw BLS series ID is also accepted, but BLS rate-limits by client IP and Datakoot runs on shared edge IPs, so an uncached series may return an upstream-limit error instead of data; that error means BLS refused, not that the series does not exist.",
+    inputSchema: { type: "object", properties: { series: { type: "string" } }, required: ["series"] },
+  },
+  {
+    name: "list_indicators",
+    description: "List the indicators this server supports (World Bank + US BLS), with descriptions. Call this to discover what you can query.",
+    inputSchema: { type: "object", properties: {} },
+  },
+];
+
+function resolveWB(indicator) {
+  const k = String(indicator || "").toLowerCase().trim();
+  if (WB[k]) return { code: WB[k][0], label: WB[k][1] };
+  if (/^[A-Za-z]{2,}\.[A-Za-z0-9.]+$/.test(indicator)) return { code: indicator, label: indicator }; // raw WB code
+  return null;
+}
+
+async function runTool(name, args, env) {
+  if (name === "list_indicators") {
+    return {
+      world_bank: Object.fromEntries(Object.entries(WB).map(([k, v]) => [k, v[1]])),
+      us_bls: Object.fromEntries(Object.entries(BLS).map(([k, v]) => [k, v[1]])),
+      note: "country_indicator/country_profile/compare_countries use World Bank; us_series uses US BLS. Raw indicator/series codes are also accepted.",
+    };
+  }
+  if (name === "country_indicator") {
+    const ind = resolveWB(args.indicator);
+    if (!ind) return { error: `Unknown indicator '${args.indicator}'. Call list_indicators to see options.` };
+    const r = await wbSeries(args.country, ind.code, Math.min(args.years || 12, 40));
+    if (!r) return { error: `No data for ${args.indicator} / ${args.country}. Check the country code (ISO2/ISO3).` };
+    return { country: r.country, indicator: ind.label, code: ind.code, series: r.series, source: "World Bank (CC-BY 4.0)" };
+  }
+  if (name === "country_profile") {
+    const out = { country: args.country, latest: {}, source: "World Bank (CC-BY 4.0)" };
+    for (const key of PROFILE) {
+      const r = await wbSeries(args.country, WB[key][0], 5);
+      if (r && r.series.length) { out.country = r.country; out.latest[key] = { label: WB[key][1], year: r.series[0].year, value: r.series[0].value }; }
+    }
+    if (!Object.keys(out.latest).length) return { error: `No data for country '${args.country}'. Use an ISO code like US, DE, JP.` };
+    return out;
+  }
+  if (name === "compare_countries") {
+    const ind = resolveWB(args.indicator);
+    if (!ind) return { error: `Unknown indicator '${args.indicator}'. Call list_indicators.` };
+    const results = [];
+    for (const c of (args.countries || []).slice(0, 12)) {
+      const r = await wbSeries(c, ind.code, 5);
+      results.push(r && r.series.length ? { country: r.country, year: r.series[0].year, value: r.series[0].value } : { country: c, value: null });
+    }
+    results.sort((a, b) => (b.value ?? -Infinity) - (a.value ?? -Infinity));
+    return { indicator: ind.label, code: ind.code, ranking: results, source: "World Bank (CC-BY 4.0)" };
+  }
+  if (name === "us_series") {
+    const k = String(args.series || "").toLowerCase().trim();
+    const id = BLS[k] ? BLS[k][0] : args.series;
+    const label = BLS[k] ? BLS[k][1] : args.series;
+    const r = await dkBls(id, env);
+    if (r && r._empty) return { error: `BLS reports no observations for '${args.series}'. Call list_indicators, or pass a valid BLS series ID.` }; if (!r || r._error) return { error: "The US Bureau of Labor Statistics API is not answering right now (" + ((r && r._error) || "unavailable") + "). This is an upstream rate limit, NOT a statement that '" + args.series + "' does not exist or has no data. BLS throttles by client IP and Cloudflare's egress IPs are shared, so this can persist. US annual indicators are available meanwhile via country_indicator with country=US." };
+    const outS = { series: label, seriesID: r.seriesID, data: r.data, as_of: r.as_of, source: "US Bureau of Labor Statistics (public domain)" }; if (r.stale) outS.note = "Served from Datakoot's last successful BLS retrieval on " + r.as_of + " because BLS is rate-limiting right now (" + r.upstream + "). BLS series are published monthly, so the newest observation below is normally still the current one; check its year and period."; return outS;
+  }
+  return { error: "unknown tool" };
+}
+
+/* --------------------------------------------------------------- MCP core */
+function rpc(id, result) { return { jsonrpc: "2.0", id, result }; }
+function rpcErr(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
+
+async function handleMCP(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json(rpcErr(null, -32700, "Parse error")); }
+  const { id, method, params } = body || {};
+  console.log("DKPULSE " + (method || "?") + " " + ((params && params.name) || "-"));
+  if (method === "initialize") {
+    return json(rpc(id, {
+      protocolVersion: dkProto(params), capabilities: { tools: {} }, serverInfo: SERVER,
+      instructions: "Economy Intel: macroeconomic data for AI agents — GDP, inflation, unemployment, population and more for any country (World Bank), plus key US labor & price series (BLS). Call list_indicators to discover what's available.",
+    }));
+  }
+  if (method === "notifications/initialized" || method === "notifications/cancelled") return new Response(null, { status: 202, headers: CORS });
+  if (method === "ping") return json(rpc(id, {}));
+  if (method === "tools/list") return json(rpc(id, { tools: dkDescribe(TOOLS) }));
+  if (method === "tools/call") {
+    const access = await dkGate(request, env);
+    if (!access.ok) return json(rpc(id, { content: [{ type: "text", text: access.message }], isError: true }), 200, access.headers);
+    const tname = params && params.name;
+    const args = (params && params.arguments) || {};
+    if (!TOOLS.find((t) => t.name === tname)) return json(rpcErr(id, -32602, `Unknown tool: ${tname}`)); { const _s = (TOOLS.find((t) => t.name === tname).inputSchema || {}).properties || {}; const _rq = ((TOOLS.find((t) => t.name === tname) || {}).inputSchema || {}).required || []; const _bad = Object.keys(args).filter((k) => !(k in _s)).map((k) => "unexpected '" + k + "'").concat(_rq.filter((k) => args[k] === undefined || args[k] === null || args[k] === "").map((k) => "missing required '" + k + "'")); if (_bad.length) return json(rpcErr(id, -32602, "Bad arguments for " + tname + ": " + _bad.join(", ") + ". Valid: " + (Object.keys(_s).join(", ") || "none") + ". The call was refused rather than ignoring them, because ignoring an argument returns a confident answer to a different question than the one asked.")); }
+    try {
+      const out = await runTool(tname, args, env);
+      const meta = access.pro ? "" : `\n\n(${access.remaining} free calls left today)`;
+      return json(rpc(id, { content: [{ type: "text", text: JSON.stringify(out, null, 2) + meta }], isError: !!(out && out.error) }), 200, access.headers);
+    } catch (e) {
+      return json(rpc(id, { content: [{ type: "text", text: "Error: " + (e && e.message || String(e)) }], isError: true }));
+    }
+  }
+  return json(rpcErr(id, -32601, `Method not found: ${method}`));
+}
+
+/* ----------------------------------------------------------------- landing */
+const CSS = `:root{--bg:#0b0e14;--panel:#111725;--border:#1e2636;--text:#e6edf3;--muted:#8b98a9;--accent:#4ade80;--accent2:#22d3ee}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;line-height:1.6}
+a{color:var(--accent2);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:1000px;margin:0 auto;padding:0 20px}
+header{position:sticky;top:0;z-index:50;background:#0b0e14;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:18px;padding:12px 20px}
+.logo{display:flex;align-items:center;gap:9px;font-weight:800;font-size:19px}.logo svg{display:block}
+nav{display:flex;gap:16px;margin-left:auto;flex-wrap:wrap;font-size:14px}nav a{color:var(--muted)}nav a:hover{color:var(--text)}
+.hero{padding:64px 0 32px}.hero h1{font-size:44px;line-height:1.1;margin:0 0 14px}.hero .accent{color:var(--accent)}
+.sub{font-size:19px;color:var(--muted);max-width:640px}
+.section{padding:28px 0;border-top:1px solid var(--border)}
+.grid{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:760px){.grid{grid-template-columns:1fr 1fr}}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px;min-width:0}
+.card h3{margin:0 0 6px;font-size:16px}.card code{color:var(--accent);font-size:13px}.card p{margin:6px 0 0;color:var(--muted);font-size:14px}
+.cmd{display:flex;align-items:center;gap:8px;background:#0a0d13;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:14px 0;overflow-x:auto}
+.cmd code{font:13px/1.5 ui-monospace,Menlo,monospace;color:var(--text);white-space:nowrap}
+.tiers{display:grid;grid-template-columns:1fr;gap:14px}@media(min-width:760px){.tiers{grid-template-columns:1fr 1fr 1fr}}
+.tier{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px}.tier b{font-size:18px}.tier span{display:block;color:var(--muted);font-size:14px;margin-top:4px}
+.btn{display:inline-block;background:var(--accent);color:#06210f;font-weight:700;padding:10px 18px;border-radius:8px;margin-top:8px}
+footer{border-top:1px solid var(--border);padding:32px 20px;color:var(--muted);font-size:14px;text-align:center}`;
+const MARK = `<svg width="26" height="26" viewBox="-34 -34 68 68" style="vertical-align:-4px"><g stroke="#4ade80" stroke-width="5" fill="none" stroke-linejoin="round"><polygon points="0,-30 26,-15 26,15 0,30 -26,15 -26,-15"/></g><g fill="#4ade80"><circle cx="0" cy="-12" r="6"/><circle cx="-11" cy="8" r="6"/><circle cx="11" cy="8" r="6"/></g></svg>`;
+
+function landing(host) {
+  const ep = `https://${host}/mcp`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Economy Intel MCP — Macro data for your AI agent | Datakoot</title>
+<meta name="description" content="Keyless MCP server giving AI agents live macroeconomic data: GDP, inflation, unemployment, population and trade for every country (World Bank) plus key US series (BLS).">
+<style>${CSS}</style></head><body>
+<header><a href="https://datakoot.com/" style="color:inherit"><div class="logo">${MARK}Data<span style="color:var(--accent)">koot</span></div></a>
+<nav><a href="https://datakoot.com/">Datakoot</a><a href="#tools">Tools</a><a href="#start">Quick start</a><a href="#pricing">Pricing</a><a href="https://github.com/datakoot">GitHub</a></nav></header>
+<div class="wrap">
+<section class="hero"><h1>Ground your agent in the <span class="accent">real economy</span>.</h1>
+<p class="sub">Economy Intel serves live macro data — GDP, inflation, unemployment, population, trade, debt — for every country from the World Bank, plus key US labor and price series from the BLS. No API keys.</p></section>
+<section class="section" id="tools"><h2>Tools</h2><div class="grid">
+<div class="card"><h3><code>country_indicator</code></h3><p>Any indicator for a country, over time.</p></div>
+<div class="card"><h3><code>country_profile</code></h3><p>Key macro snapshot for a country.</p></div>
+<div class="card"><h3><code>compare_countries</code></h3><p>Rank an indicator across economies.</p></div>
+<div class="card"><h3><code>us_series</code></h3><p>US unemployment, CPI, payrolls (BLS).</p></div>
+<div class="card"><h3><code>list_indicators</code></h3><p>Discover everything available.</p></div>
+</div></section>
+<section class="section" id="start"><h2>Quick start</h2>
+<p class="sub">One line, no key. Works with Claude, Cursor, and any MCP client.</p>
+<div class="cmd"><code>claude mcp add --transport http economy-intel ${ep}</code></div>
+<p style="color:var(--muted);font-size:14px">Or point any MCP client at <code>${ep}</code></p></section>
+<section class="section" id="pricing"><h2>Pricing</h2><div class="tiers">
+<div class="tier"><b>Free</b><span>100 calls / day</span><span>Every tool, no key.</span></div>
+<div class="tier"><b>$15/mo · Pro</b><span>10,000 calls / month</span><span>1 seat · one key unlocks all nine Datakoot servers · then $5 per 1,000, capped at $100.</span><a class="btn" href="${CHECKOUT}">Upgrade</a></div>
+<div class="tier"><b>$49/mo · Team</b><span>50,000 calls / month</span><span>One key your whole team shares · then $5 per 1,000.</span><a class="btn" href="https://buy.polar.sh/polar_cl_Dh7xGx3WMRxhD169lIPCV7xV0AOeZuWzhyHhT2RmTpA">Start Team</a></div>
+</div></section>
+</div>
+<footer><a href="https://datakoot.com/" style="color:inherit">Datakoot</a> — infrastructure for the agent economy · <a href="https://github.com/datakoot">GitHub</a> · Data: World Bank (CC-BY 4.0), U.S. BLS (public domain)</footer>
+</body></html>`;
+}
+
+/* ------------------------------------------------------------------ router */
+export default {
+  async fetch(request, env) {
+    if (DK_SALT === null) DK_SALT = env.IP_SALT || "";
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/.well-known/owners.json")) return json({ $schema: "https://verifymcp.io/schemas/owners.json", owners: ["hello@datakoot.com"] });
+    if (url.pathname === "/mcp" || url.pathname === "/sse") {
+      if (request.method === "POST") return handleMCP(request, env);
+      return json({ error: "POST JSON-RPC to this endpoint (MCP streamable HTTP)" }, 405);
+    }
+    if (url.pathname === "/health") return json({ ok: true, server: SERVER });
+    if (url.pathname === "/" || url.pathname === "") return new Response(landing(url.host), { headers: { "Content-Type": "text/html; charset=utf-8", ...CORS } });
+    return new Response("Not found", { status: 404, headers: CORS });
+  },
+};
+
+
+/* ==================== Datakoot call metering (D1) =========================
+ * Supersedes the older KV gate above, which is now unused.
+ *
+ * KV caches reads at the edge and is eventually consistent, so a
+ * read-modify-write counter loses increments under any real concurrency —
+ * measured against production on 2026-08-29: seven consecutive calls moved
+ * the counter by three, and once moved it backwards. D1 does the read, the
+ * increment and the return in ONE statement inside ONE transaction, so no
+ * increment can be lost. Proven on security-intel in production the same day:
+ * 731 calls fired, 731 counted, and every call past 100 refused — no leaks,
+ * no false refusals.
+ *
+ * Binding QUOTA_DB -> database "datakoot-quota", table:
+ *   quota(k TEXT PRIMARY KEY, period TEXT NOT NULL,
+ *         n INTEGER NOT NULL, updated INTEGER NOT NULL DEFAULT 0)
+ * One row per caller, reused across periods, so the table grows with the
+ * number of distinct callers rather than with time.
+ *
+ * dkGate() returns { allowed, ok, pro, remaining, limit, message, headers, meta }.
+ * `ok` mirrors `allowed`; `pro` is true whenever the call is not metered against
+ * the free allowance, so a caller-facing meter line reads correctly either way.
+ * ========================================================================= */
+const DK_FREE_LIMIT = 100;        // anonymous, keyless, per UTC day
+const DK_PRO_INCLUDED = 10000;    // calls included in Pro each month
+const DK_OVERAGE_PER = 1000;      // then $5 per 1,000
+const DK_CHECKOUT = "https://buy.polar.sh/polar_cl_Q9y3qLrNbtsssN3w5m8SK56oNcruwrmxLEPnd34oAZf";
+const DK_POLAR_ORG = "7f455043-0b15-4a1c-b7a0-9c06c9f3b95e";
+const DK_BUMP_SQL =
+  "INSERT INTO quota (k, period, n, updated) VALUES (?1, ?2, 1, ?3) " +
+  "ON CONFLICT(k) DO UPDATE SET " +
+  "n = CASE WHEN quota.period = excluded.period THEN quota.n + 1 ELSE 1 END, " +
+  "period = excluded.period, updated = excluded.updated RETURNING n";
+
+async function dkBump(env, k, period) {
+  const row = await env.QUOTA_DB.prepare(DK_BUMP_SQL).bind(k, period, Math.floor(Date.now() / 1000)).first();
+  const n = row && row.n;
+  if (typeof n !== "number") throw new Error("quota: no row returned");
+    await dkDaily(env, k, period);
+  return n;
+}
+
+/* Identify a caller without storing an identity.
+ *
+ * This is an HMAC, not a plain hash, and the key is a 256-bit secret held only
+ * in the Worker's environment (IP_SALT). That distinction matters: a plain
+ * SHA-256 of an IPv4 address is reversible by anyone who has the code, because
+ * there are only 4.3 billion addresses to try. Keyed, it is not reversible
+ * without the secret — which is never stored beside the data it protects.
+ *
+ * If IP_SALT is ever unset the function still works, unkeyed, so a missing
+ * secret degrades privacy rather than taking the service down.
+ */
+let DK_SALT = null, DK_KEY = null;
+async function dkMacKey() {
+  if (!DK_KEY) {
+    DK_KEY = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode(DK_SALT || "dk1-unsalted"),
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  }
+  return DK_KEY;
+}
+async function dkSha96(s) {
+  const b = await crypto.subtle.sign("HMAC", await dkMacKey(), new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].slice(0, 12).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/* Headers so a developer can watch the meter instead of guessing. */
+function dkHeaders(limit, remaining) {
+  if (limit == null) return {};
+  const t = new Date();
+  return {
+    "X-RateLimit-Limit": String(limit),
+    "X-RateLimit-Remaining": String(remaining == null ? limit : remaining),
+    "X-RateLimit-Reset": String(Math.floor(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + 1) / 1000)),
+  };
+}
+
+/* Unmetered: a valid Pro key, or metering that could not run. Never blocked. */
+const DK_OPEN = { allowed: true, ok: true, pro: true, remaining: null, limit: null, message: "", headers: {}, meta: "" };
+
+async function dkGate(request, env) {
+  let key = (request.headers.get("Authorization") || "").trim();
+  if (key.toLowerCase().indexOf("bearer ") === 0) key = key.slice(7).trim();
+  if (!key) key = (request.headers.get("X-Datakoot-Key") || "").trim();
+
+  if (key) {
+    let pro = false;
+    if (env.RL) { try { if ((await env.RL.get("pk:" + (await dkSha96("dk1:" + key)))) === "1") pro = true; } catch (e) {} }
+    if (!pro) {
+      try {
+        const vr = await fetch("https://api.polar.sh/v1/customer-portal/license-keys/validate", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: key, organization_id: DK_POLAR_ORG }),
+        });
+        if (vr.ok) { const _pd = await vr.json().catch(() => null); pro = !!(_pd && (!("status" in _pd) || _pd.status === "granted")); if (pro && env.RL) { try { await env.RL.put("pk:" + (await dkSha96("dk1:" + key)), "1", { expirationTtl: 3600 }); } catch (e) {} } }
+      } catch (e) { /* Polar unreachable: fall through to the invalid-key branch */ }
+    }
+    if (!pro) {
+      // A key that does not validate used to fall silently back to the free
+      // tier, so a paying customer with a typo looked throttled for no reason.
+      return { allowed: false, ok: false, pro: false, remaining: 0, limit: DK_FREE_LIMIT, meta: "",
+        headers: dkHeaders(DK_FREE_LIMIT, 0),
+        message: "That Datakoot API key was not recognised. Check it at https://datakoot.com/pricing, or remove the Authorization header to use the free tier (" + DK_FREE_LIMIT + " calls/day, no signup)." };
+    }
+    // Pro is metered but never blocked: overage is billed, not refused.
+    if (env.QUOTA_DB) {
+      try { await dkBump(env, "pro:" + (await dkSha96("dk1:" + key)), new Date().toISOString().slice(0, 7)); }
+      catch (e) { console.error("QUOTA error (pro):", e && e.message); }
+    }
+    return DK_OPEN;
+  }
+
+  if (!env.QUOTA_DB) {
+    // Fail OPEN so a misconfiguration never takes the API down — but say so.
+    console.error("DATAKOOT METERING DISABLED: env.QUOTA_DB is not bound");
+    return DK_OPEN;
+  }
+  let n;
+  try {
+    n = await dkBump(env, "ip:" + (await dkSha96("dk1:" + (request.headers.get("CF-Connecting-IP") || "anon"))), new Date().toISOString().slice(0, 10));
+  } catch (e) {
+    console.error("DATAKOOT METERING ERROR, failing open:", e && e.message);
+    return DK_OPEN;
+  }
+  // The Nth call writes n = N, so call DK_FREE_LIMIT is the last one allowed
+  // and call DK_FREE_LIMIT + 1 is the first one refused.
+  if (n > DK_FREE_LIMIT) {
+    return { allowed: false, ok: false, pro: false, remaining: 0, limit: DK_FREE_LIMIT, meta: "",
+      headers: dkHeaders(DK_FREE_LIMIT, 0),
+      message: "Daily free limit reached (" + DK_FREE_LIMIT + " calls). It resets at 00:00 UTC. Datakoot Pro includes " + DK_PRO_INCLUDED.toLocaleString() + " calls a month across all nine servers for $15, then $5 per " + DK_OVERAGE_PER.toLocaleString() + " — " + DK_CHECKOUT };
+  }
+  const left = DK_FREE_LIMIT - n;
+  return { allowed: true, ok: true, pro: false, remaining: left, limit: DK_FREE_LIMIT, message: "",
+    headers: dkHeaders(DK_FREE_LIMIT, left), meta: "\n\n(" + left + " free calls left today)" };
+}
+
+/* MCP protocol negotiation.
+ *
+ * Echo back the version the client asked for when we speak it, otherwise answer
+ * with the newest one we do. These servers answered a hardcoded "2024-11-05" to
+ * every client, which meant no client could rely on structuredContent or
+ * outputSchema — both introduced in 2025-06-18. Same list and same behaviour as
+ * base-intel and domain-intel, which already did this correctly.
+ */
+const DK_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+function dkProto(params) {
+  const want = params && params.protocolVersion;
+  return DK_PROTOCOL_VERSIONS.indexOf(want) !== -1 ? want : DK_PROTOCOL_VERSIONS[0];
+}
+
+/* Retention analytics.
+ *
+ * `quota` keeps ONE row per caller and overwrites it when the day rolls over,
+ * so it can only ever show a caller's most recent active day. That makes the
+ * most valuable question — did anyone come back tomorrow? — structurally
+ * unanswerable. `daily` keeps one row per caller PER DAY instead.
+ *
+ * It stores exactly what `quota` stores: the same keyed, non-reversible caller
+ * identifier, a date, a count. No queries, no addresses, nothing new about
+ * anyone. The 04:17 retention job prunes it on the same 90-day clock, so the
+ * privacy policy stays true.
+ *
+ * Wrapped so it can never break a caller's request: if this write fails the
+ * call still succeeds and metering is unaffected. It is analytics, not billing.
+ */
+const DK_DAILY_SQL =
+  "INSERT INTO daily (k, period, n, updated) VALUES (?1, ?2, 1, ?3) " +
+  "ON CONFLICT(k, period) DO UPDATE SET n = daily.n + 1, updated = excluded.updated";
+async function dkDaily(env, k, period) {
+  try {
+    await env.QUOTA_DB.prepare(DK_DAILY_SQL)
+      .bind(k, period, Math.floor(Date.now() / 1000)).run();
+  } catch (e) { /* never let analytics break a paying or free call */ }
+}
