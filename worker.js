@@ -41,7 +41,44 @@ const BLS = {
   us_nonfarm_payrolls: ["CES0000000001", "US total nonfarm payrolls (thousands)"],
   us_labor_participation: ["LNS11300000", "US labor force participation rate (%)"],
   us_avg_hourly_earnings: ["CES0500000003", "US avg hourly earnings, private (US$)"],
+  us_ppi: ["WPSFD49207", "US PPI final demand, seasonally adjusted (index)"],
 };
+const CENSUS = { us_retail_sales: "US advance retail & food services sales, SA (US$ millions)" };
+const DK_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const DK_CENSUS_FRESH = 21600, DK_CENSUS_KEEP = 3888000;
+// US retail sales is Census (Advance Monthly Retail Trade / MARTS), not BLS, and
+// Census now requires a free API key for DATA queries (metadata stays open).
+// Gated behind env.CENSUS_KEY and warm-cached like dkBls, so a missing or
+// rate-limited key degrades to a clear message or the last good data — never fake data.
+async function dkCensus(env) {
+  const ck = "census:marts:44X72:SM:SA";
+  let c = null;
+  if (env && env.RL) { try { c = JSON.parse((await env.RL.get(ck)) || "null"); } catch (e) {} }
+  if (c && c.data && (Date.now() - c.t) < DK_CENSUS_FRESH * 1000) return { seriesID: c.id, data: c.data, as_of: c.as_of, stale: false };
+  const key = (env && env.CENSUS_KEY) || "";
+  if (!key) return { _nokey: true };
+  let up = "unavailable";
+  try {
+    const url = "https://api.census.gov/data/timeseries/eits/marts?get=cell_value,time&category_code=44X72&data_type_code=SM&seasonally_adj=yes&time=from+2023&key=" + encodeURIComponent(key);
+    const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+    if (!r.ok) { up = "upstream " + r.status; }
+    else {
+      const d = await r.json().catch(function () { return null; });
+      if (!Array.isArray(d) || d.length < 2) { up = "bad json from upstream"; }
+      else {
+        const hdr = d[0], ti = hdr.indexOf("time"), vi = hdr.indexOf("cell_value");
+        const rows = d.slice(1).filter(function (x) { return x[vi] !== null && x[vi] !== ""; }).sort(function (a, b) { return a[ti] < b[ti] ? 1 : -1; });
+        const data = rows.slice(0, 24).map(function (x) { const p = String(x[ti]).split("-"); return { year: p[0], period: DK_MONTHS[parseInt(p[1], 10) - 1] || p[1], value: x[vi] }; });
+        if (!data.length) return { _empty: true };
+        const rec = { id: "Census MARTS 44X72 SM SA", data: data, as_of: new Date().toISOString().slice(0, 10), t: Date.now() };
+        if (env && env.RL) { try { await env.RL.put(ck, JSON.stringify(rec), { expirationTtl: DK_CENSUS_KEEP }); } catch (e) {} }
+        return { seriesID: rec.id, data: data, as_of: rec.as_of, stale: false };
+      }
+    }
+  } catch (e) { up = (e && e.message) || "network error"; }
+  if (c && c.data) return { seriesID: c.id, data: c.data, as_of: c.as_of, stale: true, upstream: up };
+  return { _error: up };
+}
 
 /* ------------------------------------------------------------------ helpers */
 const CORS = {
@@ -90,7 +127,7 @@ async function blsSeries(seriesId) {
 }
 
 /* ------------------------------------------------------------------- tools */
-const DK_AD = {"*.country":"Country as an ISO code or name, e.g. US, USA, or United States.","*.indicator":"World Bank indicator key: gdp, gdp_per_capita, gdp_growth, inflation, population, unemployment, life_expectancy, exports, imports, govt_debt_pct_gdp, real_interest_rate, fdi, co2_per_capita, internet_users. Call list_indicators for the full set. Raw World Bank codes are also accepted.","country_indicator.years":"How many of the most recent years to return.","compare_countries.countries":"Array of country codes or names to compare, e.g. [\"US\", \"DE\", \"JP\"].","us_series.series":"One of the five warm BLS series: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings. Those five are cached by Datakoot and always available. A raw BLS series ID is also accepted, but uncached series often hit BLS rate limits."};
+const DK_AD = {"*.country":"Country as an ISO code or name, e.g. US, USA, or United States.","*.indicator":"World Bank indicator key: gdp, gdp_per_capita, gdp_growth, inflation, population, unemployment, life_expectancy, exports, imports, govt_debt_pct_gdp, real_interest_rate, fdi, co2_per_capita, internet_users. Call list_indicators for the full set. Raw World Bank codes are also accepted.","country_indicator.years":"How many of the most recent years to return.","compare_countries.countries":"Array of country codes or names to compare, e.g. [\"US\", \"DE\", \"JP\"].","us_series.series":"A US series key: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings, us_ppi (BLS), or us_retail_sales (US Census). These are cached by Datakoot and kept current. A raw BLS series ID is also accepted, but uncached series often hit BLS rate limits."};
 function dkDescribe(ts) { try { for (const t of ts) { const p = ((t.inputSchema || {}).properties) || {}; for (const k of Object.keys(p)) { const d = DK_AD[t.name + "." + k] || DK_AD["*." + k]; if (d && p[k] && !p[k].description) p[k].description = d; } } } catch (e) {} return ts; }
 const TOOLS = [
   {
@@ -110,7 +147,7 @@ const TOOLS = [
   },
   {
     name: "us_series",
-    description: "Get a key US economic time series from the Bureau of Labor Statistics: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings. These five are kept warm by Datakoot and are always available. A raw BLS series ID is also accepted, but BLS rate-limits by client IP and Datakoot runs on shared edge IPs, so an uncached series may return an upstream-limit error instead of data; that error means BLS refused, not that the series does not exist.",
+    description: "Get a key US economic time series. From the Bureau of Labor Statistics: us_unemployment_rate, us_cpi, us_nonfarm_payrolls, us_labor_participation, us_avg_hourly_earnings, us_ppi. From the US Census Bureau: us_retail_sales (advance retail & food services, seasonally adjusted). The BLS series are kept warm by Datakoot and always available. A raw BLS series ID is also accepted, but BLS rate-limits by client IP and Datakoot runs on shared edge IPs, so an uncached series may return an upstream-limit error instead of data; that error means the upstream refused, not that the series does not exist.",
     inputSchema: { type: "object", properties: { series: { type: "string" } }, required: ["series"] },
   },
   {
@@ -132,7 +169,8 @@ async function runTool(name, args, env) {
     return {
       world_bank: Object.fromEntries(Object.entries(WB).map(([k, v]) => [k, v[1]])),
       us_bls: Object.fromEntries(Object.entries(BLS).map(([k, v]) => [k, v[1]])),
-      note: "country_indicator/country_profile/compare_countries use World Bank; us_series uses US BLS. Raw indicator/series codes are also accepted.",
+      us_census: CENSUS,
+      note: "country_indicator/country_profile/compare_countries use World Bank; us_series uses US BLS, plus US Census for us_retail_sales. Raw indicator/series codes are also accepted.",
     };
   }
   if (name === "country_indicator") {
@@ -164,6 +202,15 @@ async function runTool(name, args, env) {
   }
   if (name === "us_series") {
     const k = String(args.series || "").toLowerCase().trim();
+    if (k === "us_retail_sales" || k === "retail_sales") {
+      const r = await dkCensus(env);
+      if (r && r._nokey) return { error: "US retail sales is not available right now (Datakoot's Census data key is being provisioned). CPI, unemployment, payrolls, participation, earnings and PPI are available now via us_series." };
+      if (r && r._empty) return { error: "The US Census Bureau reports no retail-sales observations right now." };
+      if (!r || r._error) return { error: "The US Census retail-sales API is not answering right now (" + ((r && r._error) || "unavailable") + "). This is an upstream issue, not a statement that the series has no data." };
+      const outR = { series: CENSUS.us_retail_sales, seriesID: r.seriesID, data: r.data, as_of: r.as_of, source: "US Census Bureau — Advance Monthly Retail Trade (public domain)" };
+      if (r.stale) outR.note = "Served from Datakoot's last successful Census retrieval on " + r.as_of + ".";
+      return outR;
+    }
     const id = BLS[k] ? BLS[k][0] : args.series;
     const label = BLS[k] ? BLS[k][1] : args.series;
     const r = await dkBls(id, env);
