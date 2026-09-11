@@ -59,7 +59,7 @@ async function dkCensus(env) {
   if (!key) return { _nokey: true };
   let up = "unavailable";
   try {
-    const url = "https://api.census.gov/data/timeseries/eits/marts?get=cell_value,time&category_code=44X72&data_type_code=SM&seasonally_adj=yes&time=from+2023&key=" + encodeURIComponent(key);
+    const url = "https://api.census.gov/data/timeseries/eits/marts?get=cell_value&category_code=44X72&data_type_code=SM&seasonally_adj=yes&time=from+2023&key=" + encodeURIComponent(key);
     const r = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
     if (!r.ok) { up = "upstream " + r.status; }
     else {
