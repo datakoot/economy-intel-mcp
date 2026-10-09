@@ -1,0 +1,12 @@
+{
+  "name": "economy-intel-mcp",
+  "private": true,
+  "type": "module",
+  "description": "Datakoot economy MCP server (Cloudflare Worker). Production: https://economy.datakoot.com/mcp. Local stdio: node stdio.mjs",
+  "scripts": {
+    "start": "node stdio.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
